@@ -183,5 +183,22 @@ function displayVersionElement(element) {
     }
 }
 
+async function addVersionInfo() {
+    // 获取当前版本
+    const currentVersion = await fetchVersion('/VERSION.txt', '获取当前版本失败', {
+        cache: 'no-store'
+    });
+
+    // 创建版本信息元素
+    const versionElement = document.createElement('p');
+    versionElement.className = 'text-gray-500 text-sm mt-1 text-center md:text-left';
+
+    // 添加当前版本信息
+    versionElement.innerHTML = `版本: ${currentVersion}`;
+
+    // 显示版本元素
+    displayVersionElement(versionElement);
+}
+
 // 页面加载完成后添加版本信息
-// document.addEventListener('DOMContentLoaded', addVersionInfoToFooter);
+document.addEventListener('DOMContentLoaded', addVersionInfo);
