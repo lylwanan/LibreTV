@@ -218,6 +218,38 @@ export async function onRequest(context) {
         return content && typeof content === 'string' && content.trim().startsWith('#EXTM3U');
     }
 
+    // 判断 Content-Type 是否为"文本类"内容（可以安全地用 .text() 读取）
+    // 二进制内容（图片/音视频分片/octet-stream 等）绝不能用 .text() 读取
+    // 那会按 UTF-8 解析破坏字节，并且必须全量缓冲后才能返回，无法流式转发。
+    function isTextualContent(contentType) {
+        if (!contentType) return true; // 未知的 Content-Type 保守按文本处理（与原逻辑一致，M3U8/JSON 多为文本）
+        const ct = contentType.toLowerCase();
+        const textualHints = [
+            'text/', 'application/json', 'application/xml', 'text/xml',
+            'application/javascript', 'application/x-javascript',
+            'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl',
+            'application/x-www-form-urlencoded', 'image/svg+xml', 'application/manifest+json'
+        ];
+        return textualHints.some(hint => ct.includes(hint));
+    }
+
+    // 发起请求并返回原始 Response（不读取 body），用于二进制内容的流式转发
+    async function fetchRawResponse(targetUrl) {
+        const headers = {
+            'User-Agent': getRandomUserAgent(),
+            'Accept': '*/*',
+            'Accept-Language': request.headers.get('Accept-Language') || 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Referer': request.headers.get('Referer') || new URL(targetUrl).origin
+        };
+        logDebug(`开始直接请求(raw): ${targetUrl}`);
+        const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+        if (!response.ok) {
+            const errorBody = await response.text().catch(() => '');
+            throw new Error(`HTTP error ${response.status}: ${response.statusText}. URL:${targetUrl}. Body:${errorBody.substring(0,150)}`);
+        }
+        return response;
+    }
+
     // 判断是否是媒体文件 (根据扩展名和 Content-Type) - 这部分在此代理中似乎未使用，但保留
     function isMediaFile(url, contentType) {
         if (contentType) {
@@ -464,8 +496,26 @@ export async function onRequest(context) {
             }
         }
 
-        // --- 实际请求 ---
-        const { content, contentType, responseHeaders } = await fetchContentWithType(targetUrl);
+        // --- 实际请求（返回原始 Response，先不读取 body）---
+        const upstream = await fetchRawResponse(targetUrl);
+        const contentType = upstream.headers.get('Content-Type') || '';
+
+        // --- 二进制/媒体内容（图片、音视频分片等）：流式返回，禁止 .text()，且不写 KV ---
+        // 旧实现对所有响应调用 .text()，会损坏二进制且无法流式传输（例如豆瓣封面图会裂图）。
+        if (!isTextualContent(contentType)) {
+        logDebug(`流式转发二进制内容: ${targetUrl}，类型: ${contentType}`);
+        const streamHeaders = new Headers(upstream.headers);
+        // Workers 的 body 已是解压后的流。必须移除源站的编码/长度头，避免客户端二次解码
+        streamHeaders.delete('content-encoding');
+        streamHeaders.delete('content-length');
+        streamHeaders.set('Cache-Control', 'public, max-age=' + CACHE_TTL);
+        // 直接把上游 ReadableStream 作为响应体，实现边下边发的流式转发（createResponse 负责补 CORS 头）
+        return createResponse(upstream.body, 200, streamHeaders);
+        }
+
+        // --- 文本内容：读取为文本 ---
+        const content = await upstream.text();
+        const responseHeaders = upstream.headers;
 
         // --- 写入缓存 (KV) ---
         if (kvNamespace) {
@@ -490,6 +540,8 @@ export async function onRequest(context) {
         } else {
             logDebug(`内容不是 M3U8 (类型: ${contentType})，直接返回: ${targetUrl}`);
             const finalHeaders = new Headers(responseHeaders);
+            finalHeaders.delete('content-encoding');
+            finalHeaders.delete('content-length');
             finalHeaders.set('Cache-Control', `public, max-age=${CACHE_TTL}`);
             // 添加 CORS 头，确保非 M3U8 内容也能跨域访问（例如图片、字幕文件等）
             finalHeaders.set("Access-Control-Allow-Origin", "*");

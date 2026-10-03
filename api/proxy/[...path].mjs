@@ -185,6 +185,54 @@ function isM3u8Content(content, contentType) {
     return content && typeof content === 'string' && content.trim().startsWith('#EXTM3U');
 }
 
+/**
+ * 判断 Content-Type 是否为"文本类"内容（可以安全地用 .text() 读取）
+ * 二进制内容（图片/音视频分片/octet-stream 等）绝不能用 .text() 读取
+ * 那会按 UTF-8 解析破坏字节，并且必须全量缓冲后才能返回，无法流式转发。
+ * @param {string} contentType
+ * @returns {boolean}
+ */
+function isTextualContent(contentType) {
+  // 未知的 Content-Type 保守按文本处理（与原逻辑一致，M3U8/JSON 多为文本）
+  if (!contentType) return true;
+  const ct = contentType.toLowerCase();
+  const textualHints = [
+    'text/', 'application/json', 'application/xml', 'text/xml',
+    'application/javascript', 'application/x-javascript',
+    'application/vnd.apple.mpegurl', 'application/x-mpegurl', 'audio/mpegurl',
+    'application/x-www-form-urlencoded', 'image/svg+xml', 'application/manifest+json'
+  ];
+  return textualHints.some(hint => ct.includes(hint));
+}
+
+/**
+ * 发起请求并返回原始的 node-fetch Response（不读取 body）
+ * 以便对二进制内容进行流式转发。
+ * @param {string} targetUrl
+ * @param {object} requestHeaders
+ * @returns {Promise<Response>}
+ */
+async function fetchRawResponse(targetUrl, requestHeaders) {
+  const headers = {
+    'User-Agent': getRandomUserAgent(),
+    'Accept': requestHeaders['accept'] || '*/*',
+    'Accept-Language': requestHeaders['accept-language'] || 'zh-CN,zh;q=0.8,en;q=0.8',
+    'Referer': requestHeaders['referer'] ?? new URL(targetUrl).origin,
+  };
+  Object.keys(headers).forEach(key => (headers[key] == undefined || headers[key] == null || headers[key] == '') ? delete headers[key] : {})
+
+  logDebug(`准备请求目标(raw): ${targetUrl}，请求头: ${JSON.stringify(headers)}`);
+
+  const response = await fetch(targetUrl, { headers, redirect: 'follow' });
+  if (!response.ok) {
+    const errorBody = await response.text().catch(() => "");
+    const err = new Error(`HTTP 错误 ${response.status}: ${response.statusText}. URL: ${targetUrl}. Body: ${errorBody.substring(0, 200)}`);
+    err.status = response.status;
+    throw err;
+  }
+  return response;
+}
+
 function processKeyLine(line, baseUrl) {
     return line.replace(/URI="([^"]+)"/, (match, uri) => {
         const absoluteUri = resolveUrl(baseUrl, uri);
@@ -366,37 +414,60 @@ export default async function handler(req, res) {
 
         console.info(`开始处理目标 URL 的代理请求: ${targetUrl}`);
 
-        // --- 获取并处理目标内容 ---
-        const { content, contentType, responseHeaders } = await fetchContentWithType(targetUrl, req.headers);
+        // —— 获取上游原始响应（先不读取 body），按内容类型分流 ——
+        const upstream = await fetchRawResponse(targetUrl, req.headers);
+        const contentType = upstream.headers.get('content-type') || '';
 
-        // --- 如果是 M3U8，处理并返回 ---
-        if (isM3u8Content(content, contentType)) {
-            console.info(`正在处理 M3U8 内容: ${targetUrl}`);
-            const processedM3u8 = await processM3u8Content(targetUrl, content);
+        // 转发上游响应头（剔除会破坏流式转发/已解析内容的头，以及 CORS 头—CORS 已在前面配置）
+        const forwardUpstreamHeaders = () => {
+        upstream.headers.forEach((value, key) => {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey.startsWith('access-control-') &&
+            lowerKey !== 'content-encoding' && // 很重要! node-fetch 已解压
+            lowerKey !== 'content-length' && // 很重要! 解压后长度已改变
+            lowerKey !== 'transfer-encoding') {
+            res.setHeader(key, value);
+            }
+        });
+        };
+
+        // —— 二进制/媒体内容（图片、音视频分片等）：流式转发，禁止 .text() ——
+        // 旧实现对所有响应调用 response.text()，会把二进制按 UTF-8 解析破坏，
+        // 且必须全量缓冲后才能返回，无法流式转发（例如巨量时会阻塞内存）。
+        if (!isTextualContent(contentType)) {
+            console.info(`流式转发二进制内容: ${targetUrl}, 类型: ${contentType}`);
+            forwardUpstreamHeaders();
+            res.setHeader('Cache-Control', 'public, max-age=' + CACHE_TTL);
+            res.status(200);
+            // node-fetch v3 的 body 是 Node.js Readable 流，直接 pipe 到 res，下边边读
+            upstream.body.on('error', (e) => {
+                console.error('[代理] 流式转发上游读取失败: ${targetUrl}: ${e.message}');
+                if (!res.writableEnded) res.end();
+            });
+            upstream.body.pipe(res);
+            return;
+        }
+
+        // —— 文本类内容: 读取为文本后按需处理 ——
+        const content = await upstream.text();
+
+        // —— 如果是 M3U8，处理并返回 ——
+        if (isM3U8Content(content, contentType)) {
+            console.info('正在处理 M3U8 内容: ${targetUrl}');
+            const processedM3u8 = await processM3U8Content(targetUrl, content);
 
             console.info(`成功处理 M3U8: ${targetUrl}`);
             // 发送处理后的 M3U8 响应
             res.status(200)
                 .setHeader('Content-Type', 'application/vnd.apple.mpegurl;charset=utf-8')
-                .setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`)
-                // 移除可能导致问题的原始响应头
-                .removeHeader('content-encoding') // 很重要！node-fetch 已解压
-                .removeHeader('content-length')   // 长度已改变
+                .setHeader('Cache-Control', 'public, max-age=' + CACHE_TTL)
                 .send(processedM3u8); // 发送 M3U8 文本
 
         } else {
-            // --- 如果不是 M3U8，直接返回原始内容 ---
-            console.info(`直接返回非 M3U8 内容: ${targetUrl}, 类型: ${contentType}`);
+            // —— 如果不是 M3U8，直接返回原始内容 ——
+            console.info(`直接返回非 M3U8 文本内容: ${targetUrl}, 类型: ${contentType}`);
 
-            // 设置原始响应头，但排除有问题的头和 CORS 头（已设置）
-            responseHeaders.forEach((value, key) => {
-                 const lowerKey = key.toLowerCase();
-                 if (!lowerKey.startsWith('access-control-') &&
-                     lowerKey !== 'content-encoding' && // 很重要！
-                     lowerKey !== 'content-length') {   // 很重要！
-                     res.setHeader(key, value); // 设置其他原始头
-                 }
-             });
+            forwardUpstreamHeaders();
             // 设置我们自己的缓存策略
             res.setHeader('Cache-Control', `public, max-age=${CACHE_TTL}`);
 

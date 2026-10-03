@@ -117,6 +117,13 @@ function isValidUrl(urlString) {
 }
 
 // 代理路由
+// 流式转发时必须剥离的响应头（正确性不变量，非策略偏好，故不放入 .env 的 FILTERED_HEADERS）
+// content-length/content-encoding：axios 会自动解压 gzip/deflate，解压时会丢掉 content-encoding
+// 但保留解压前的 content-length；原样转发会被浏览器按错误长度截断 封面图/接口数据偶发损坏。
+// 由于此时已无法区分"压缩"与"未压缩"，统一剥离，改用分块传输最稳妥
+// transfer-encoding/connection：逐块头，由 Express/Node 自行管理，遗留会与分块传输冲突。
+const STREAM_UNSAFE_HEADERS = ['content-length', 'content-encoding', 'transfer-encoding', 'connection'];
+
 app.get('/proxy/:encodedUrl', async (req, res) => {
   try {
     const encodedUrl = req.params.encodedUrl;
@@ -132,19 +139,25 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
     // 添加请求超时和重试逻辑
     const maxRetries = config.maxRetries;
     let retries = 0;
-    
+
     const makeRequest = async () => {
       try {
+        // 透传客户端的 Range 头: 视频分片可能使用字节范围请求(如 HLS/分片 mp4)，
+        // 不转发会导致上游返回完整 200 而非 206，破坏播放器的分段逻辑。
+        const upstreamHeaders = {
+          'User-Agent': config.userAgent,
+          'Referer': 'https://movie.douban.com/',
+          'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8'
+        };
+        if (req.headers.range) {
+          upstreamHeaders['Range'] = req.headers.range;
+        }
         return await axios({
           method: 'get',
           url: targetUrl,
           responseType: 'stream',
           timeout: config.timeout,
-          headers: {
-            'User-Agent': config.userAgent,
-            'Referer': 'https://movie.douban.com/',
-            'Accept': 'image/avif,image/webp,image/*,*/*;q=0.8'
-          }
+          headers: upstreamHeaders
         });
       } catch (error) {
         if (retries < maxRetries) {
@@ -166,6 +179,10 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
     ).split(',');
     
     sensitiveHeaders.forEach(header => delete headers[header]);
+    // 剥离会破坏流式转发的头
+    STREAM_UNSAFE_HEADERS.forEach(header => delete headers[header]);
+    // 透传上游状态码（如字节范围请求的 206），否则会被固定成 200 破坏分段语义
+    res.status(response.status || 200);
     res.set(headers);
 
     // 管道传输响应流

@@ -1,5 +1,11 @@
 // 全局常量配置
 const PROXY_URL = '/proxy/';    // 适用于 Cloudflare, Netlify (带重写), Vercel (带重写)
+// 是否让视频的二进制分片(ts/key/initSegment)走服务端 /proxy/ 中转。
+// 背景: 视频源站常按客户端 IP/地域限速，本地直连分片可能只有 ~100KB/s 而频繁卡顿;
+// 而部署服务器(VPS)到源站往往快数倍。开启后 m3u8 播放列表仍直连(体积只有几 KB),
+// 仅把大的分片交给服务器拉取再流式转发，从而绕开本地到源站的慢链路。
+// 若你的服务器到源站并不比本地快，或担心服务器带宽/流量成本，可将其设为 false。
+const VIDEO_PROXY_ENABLED = true;
 // const HOPLAYER_URL = 'https://hoplayer.com/index.html';
 const SEARCH_HISTORY_KEY = 'videoSearchHistory';
 const MAX_HISTORY_ITEMS = 5;

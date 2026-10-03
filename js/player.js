@@ -403,25 +403,37 @@ function initPlayer(videoUrl) {
     }
 
     // 配置HLS.js选项
+    // 说明：本项目视频分片由浏览器直接从采集站源站拉取，慢网(如 ~100kb/s)下
+    // ts 分片可能需要远超 hls.js 默认 20s 的总下载超时(fragLoadingTimeout)。
+    // 默认超时是"整段下载总时长"，中途有进度也不会重试，一旦超时会丢弃已下载数据
+    // 从 0 重试，导致分片永远下不完、播放器一直转圈。以下参数针对慢网做了调整。
     const hlsConfig = {
         debug: false,
-        loader: adFilteringEnabled ? CustomHlsJsLoader : Hls.DefaultConfig.loader,
+        // 始终使用自定义 loader: 它同时负责(1)把二进制分片改走 /proxy/ 中转 (2)按需过滤广告。
+        // 广告过滤是否生效由 loader 内部读取全局 adFilteringEnabled 决定。
+        loader: CustomHlsJsLoader,
         enableWorker: true,
         lowLatencyMode: false,
-        backBufferLength: 90,
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        maxBufferSize: 30 * 1000 * 1000,
-        maxBufferHole: 0.5,
+        backBufferLength: 60,        // 90 -> 60: 降低已播放缓冲的内存占用，不影响向前流畅度
+        maxBufferLength: 60,         // 30 -> 60: 慢网下缓存更长的前向内容，减少播放途中再次转圈
+        maxMaxBufferLength: 120,     // 60 -> 120: 允许在带宽空闲时缓存更多
+        maxBufferSize: 60 * 1000 * 1000, // 30MB -> 60MB: 放宽字节上限以配合更大的缓冲时长
+        maxBufferHole: 0.6,          // 0.5 -> 0.6: 对分片间小间隙更宽容，避免误判卡住
+        // —— 慢网关键项：加大超时，避免"下载中被误判超时 -> 从头重试"的死循环 ——
+        fragLoadingTimeOut: 120000,  // 默认 20000: 分片下载总超时提到 120s，让慢速下载能真正完成
         fragLoadingMaxRetry: 6,
         fragLoadingMaxRetryTimeout: 64000,
         fragLoadingRetryDelay: 1000,
+        manifestLoadingTimeOut: 30000, // 默认 10000
         manifestLoadingMaxRetry: 3,
         manifestLoadingRetryDelay: 1000,
+        levelLoadingTimeOut: 30000,   // 默认 10000
         levelLoadingMaxRetry: 4,
         levelLoadingRetryDelay: 1000,
+        // —— ABR: 慢网下更保守，优先保证不卡而非高清晰度 ——
         startLevel: -1,
-        abrEwmaDefaultEstimate: 500000,
+        capLevelToPlayerSize: true,   // 新增: 按播放器显示尺寸封顶清晰度，避免下载用不上的高码率
+        abrBandWidthEstimate: 300000, // 500000 -> 300000: 初始带宽估计更保守，起步不易冲高卡播
         abrBandWidthFactor: 0.95,
         abrBandWidthUpFactor: 0.7,
         abrMaxWithRealBitrate: true,
@@ -487,6 +499,9 @@ function initPlayer(videoUrl) {
                 let playbackStarted = false;
                 // 跟踪视频是否出现bufferAppendError
                 let bufferAppendErrorCount = 0;
+                // 跟踪致命错误恢复次数，避免无限恢复
+                let fatalRecoveryCount = 0;
+                const MAX_FATAL_RECOVERY = 3;
 
                 // 监听视频播放事件
                 video.addEventListener('playing', function () {
@@ -543,15 +558,29 @@ function initPlayer(videoUrl) {
                         }
                     }
 
-                    // 如果是致命错误，且视频未播放
-                    if (data.fatal && !playbackStarted) {
+                    // 致命错误：无论播放是否已开始都会尝试恢复。
+                    // 慢网下分片耗尽重试会在"播放开始之后"触发 fatal networkError。
+                    // 旧逻辑 (data.fatal && !playbackStarted) 此时不做任何处理，会永久卡在转圈。
+                    if (data.fatal) {
                         // 尝试恢复错误
                         switch (data.type) {
                             case Hls.ErrorTypes.NETWORK_ERROR:
-                                hls.startLoad();
+                                if (fatalRecoveryCount < MAX_FATAL_RECOVERY) {
+                                    fatalRecoveryCount++;
+                                    hls.startLoad(); // 从当前位置恢复加载
+                                } else if (!errorDisplayed) {
+                                    errorDisplayed = true;
+                                    showError('视频加载失败，网络持续不稳定，请更换视频源或稍后重试');
+                                }
                                 break;
                             case Hls.ErrorTypes.MEDIA_ERROR:
-                                hls.recoverMediaError();
+                                if (fatalRecoveryCount < MAX_FATAL_RECOVERY) {
+                                    fatalRecoveryCount++;
+                                    hls.recoverMediaError();
+                                } else if (!errorDisplayed) {
+                                    errorDisplayed = true;
+                                    showError('视频加载失败，可能是格式不兼容或源不可用');
+                                }
                                 break;
                             default:
                                 // 仅在多次恢复尝试后显示错误
@@ -697,14 +726,28 @@ function initPlayer(videoUrl) {
     }, 10000);
 }
 
-// 自定义M3U8 Loader用于过滤广告
+// 自定义 HLS Loader 承担两件事：
+// 1) 将二进制分片(ts/key/initSegment)改走服务端 /proxy/ 中转，绕开"本地→源站"的慢链路
+//    (受 VIDEO_PROXY_ENABLED 控制；播放列表 m3u8 仍直连，体积只有几 KB)
+// 2) 过滤 m3u8 中的广告分段 (受全局 adFilteringEnabled 控制)
 class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
     constructor(config) {
         super(config);
         const load = this.load.bind(this);
         this.load = function (context, config, callbacks) {
-            // 拦截manifest和level请求
-            if (context.type === 'manifest' || context.type === 'level') {
+            // ——（1）分片中转：只代理二进制分片(arraybuffer)，播放列表(text/json)保持直连 ——
+            // 关键：不改写 manifest/level 的 URL，hls.js 仍按原始播放列表 URL 解析相对路径。
+            // 解析出的分片是绝对源站地址，再在此处改写到 /proxy/ 交给服务器拉取。
+            // 改写后 URL 以 "/" 开头，不再匹配 ^https?://，故重试不会被二次编码。
+            if (VIDEO_PROXY_ENABLED &&
+                context.responseType === 'arraybuffer' &&
+                typeof context.url === 'string' &&
+                /^https?:\/\//i.test(context.url)) {
+                context.url = PROXY_URL + encodeURIComponent(context.url);
+            }
+
+            // ——（2）广告过滤：拦截 manifest 和 level 请求，移除广告分段 ——
+            if (adFilteringEnabled && (context.type === 'manifest' || context.type === 'level')) {
                 const onSuccess = callbacks.onSuccess;
                 callbacks.onSuccess = function (response, stats, context) {
                     // 如果是m3u8文件，处理内容以移除广告分段
