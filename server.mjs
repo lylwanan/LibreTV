@@ -5,6 +5,8 @@ import cors from 'cors';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import crypto from 'crypto';
+import http from 'http';
+import https from 'https';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -20,8 +22,26 @@ const config = {
   maxRetries: parseInt(process.env.MAX_RETRIES || '2'),
   cacheMaxAge: process.env.CACHE_MAX_AGE || '1d',
   userAgent: process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+  // 到源站的连接池大小(每个源站主机独立计数)，视频会连续请求大量 ts 分片，
+  // 复用连接可省掉每片的 TCP 握手 + TLS 协商 + 慢启动开销。
+  maxSockets: parseInt(process.env.PROXY_MAX_SOCKETS || '32'),
   debug: process.env.DEBUG === 'true'
 };
+
+// 全局 keep-alive Agent: 让代理到同一源站的分片请求复用已建立的 TCP/TLS 连接。
+// keepAliveMsecs 定期探测包，避免空闲连接被中间设备静默断开后又复用失败。
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: config.maxSockets,
+  maxFreeSockets: config.maxSockets
+});
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: config.maxSockets,
+  maxFreeSockets: config.maxSockets
+});
 
 const log = (...args) => {
   if (config.debug) {
@@ -157,7 +177,10 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
           url: targetUrl,
           responseType: 'stream',
           timeout: config.timeout,
-          headers: upstreamHeaders
+          headers: upstreamHeaders,
+          // 复用到源站的 keep-alive 连接，省掉每个分片的握手/慢启动开销
+          httpAgent,
+          httpsAgent
         });
       } catch (error) {
         if (retries < maxRetries) {
@@ -187,6 +210,14 @@ app.get('/proxy/:encodedUrl', async (req, res) => {
 
     // 管道传输响应流
     response.data.pipe(res);
+
+    // 客户端提前断开（切集/关页/拖动进度条）时销毁上游流，避免半读的连接卡在
+    // keep-alive 池里泄漏；正常读完时 socket 会自动归还连接池复用。
+    res.on('close', () => {
+      if (!res.writableFinished && response.data && !response.data.destroyed) {
+        response.data.destroy();
+      }
+    });
   } catch (error) {
     console.error('代理请求错误:', error.message);
     if (error.response) {
