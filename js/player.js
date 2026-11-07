@@ -771,8 +771,8 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
                 callbacks.onSuccess = function (response, stats, context) {
                     // 如果是m3u8文件，处理内容以移除广告分段
                     if (response.data && typeof response.data === 'string') {
-                        // 过滤掉广告段 - 实现更精确的广告过滤逻辑
-                        response.data = filterAdsFromM3U8(response.data, true);
+                        // 过滤广告片段 - 与服务端共用 js/m3u8-ad-filter.js 的识别规则
+                        response.data = filterAdsFromM3U8(response.data, true, context.url);
                     }
                     return onSuccess(response, stats, context);
                 };
@@ -805,23 +805,12 @@ function setupNativeHlsFallback(video, url) {
 }
 
 // 过滤可疑的广告内容
-function filterAdsFromM3U8(m3u8Content, strictMode = false) {
-    if (!m3u8Content) return '';
-
-    // 按行分割M3U8内容
-    const lines = m3u8Content.split('\n');
-    const filteredLines = [];
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-
-        // 只过滤#EXT-X-DISCONTINUITY标识
-        if (!line.includes('#EXT-X-DISCONTINUITY')) {
-            filteredLines.push(line);
-        }
-    }
-
-    return filteredLines.join('\n');
+function filterAdsFromM3U8(m3u8Content, strictMode = false, baseUrl = '') {
+  if (!m3u8Content) return '';
+  const filter = globalThis.LibreTVAdFilter;
+  if (!filter) return m3u8Content; // 模块未加载时保持原样，不影响播放
+  const result = filter.sanitizeMediaPlaylist(m3u8Content, baseUrl || currentVideoUrl || '');
+  return result.text;
 }
 
 

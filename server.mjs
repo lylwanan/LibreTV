@@ -15,6 +15,8 @@ import {
   rewritePlayUrl,
   buildTvboxConfig,
 } from './tvbox-sites.mjs';
+// 分片广告识别/剔除（浏览器与Node共用同一实现，副作用挂载globalThis.LibreTVADFilter）
+import './js/m3u8-ad-filter.js';
 
 dotenv.config();
 
@@ -154,6 +156,10 @@ function isValidUrl(urlString) {
 // 逻辑移植自 api/proxy/[...path].mjs（Vercel 版），适配到 Express + axios。
 
 const M3U8_MAX_RECURSION = parseInt(process.env.M3U8_MAX_RECURSION || '5', 10);
+// 分片广告过滤开关（服务端 /proxy 与 tvbox 通道）。网页端另由播放器开关控制。
+const AD_FILTER_ENABLED = (process.env.AD_FILTER_ENABLED || 'true') === 'true';
+// 异前缀广告块的最大时长(秒)，超过则不认为是广告（防误删长段异源内容）
+const AD_MAX_BLOCK_SECONDS = parseInt(process.env.AD_MAX_BLOCK_SECONDS || '120', 10);
 
 // 把上游文本流读成字符串（仅用于 m3u8 这类小体积文本，绝不用于二进制分片）
 function streamToString(stream) {
@@ -213,6 +219,16 @@ function m3u8ResolveUrl(baseUrl, relativeUrl) {
 // 处理媒体播放列表（分片列表）：把每个分片/KEY/MAP 改写为 /proxy/ 地址
 function processMediaPlaylist(url, content, base) {
   const baseUrl = m3u8BaseUrl(url);
+  // 先剔除广告分片，再做地址改写（保证改写后的列表不含广告）
+  if (AD_FILTER_ENABLED && globalThis.LibreTVAdFilter) {
+    const r = globalThis.LibreTVAdFilter.sanitizeMediaPlaylist(content, baseUrl, {
+      maxBlockSeconds: AD_MAX_BLOCK_SECONDS,
+    });
+    if (r.removedCount) {
+      log(`广告过滤: 移除 ${r.removedCount} 片 / ${r.removedDuration.toFixed(1)}s`, r.removed.map(x => x.uri));
+    }
+    content = r.text;
+  }
   const lines = content.split('\n');
   const out = [];
   for (let i = 0; i < lines.length; i++) {
