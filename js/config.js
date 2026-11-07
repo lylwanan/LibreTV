@@ -307,7 +307,9 @@ const PLAYER_CONFIG = {
     filterAds: true,  // 是否启用广告过滤
     autoPlayNext: true,  // 默认启用自动连播功能
     adFilteringEnabled: true, // 默认开启分片广告过滤
-    adFilteringStorage: 'adFilteringEnabled' // 存储广告过滤设置的键名
+    adFilteringStorage: 'adFilteringEnabled', // 存储广告过滤设置的键名
+    nativePlayerEnabled: true, // 默认开启：iOS 上使用系统原生播放器替代 hls.js
+    nativePlayerStorage: 'nativePlayerEnabled' // 存储原生播放器设置的键名
 };
 
 // 增加错误信息本地化

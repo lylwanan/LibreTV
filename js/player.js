@@ -86,9 +86,13 @@ let videoHasEnded = false; // 跟踪视频是否已经自然结束
 let userClickedPosition = null; // 记录用户点击的位置
 let shortcutHintTimeout = null; // 用于控制快捷键提示显示时间
 let adFilteringEnabled = true; // 默认开启广告过滤
+let nativePlayerEnabled = true; // 默认开启：iOS 上使用系统原生播放器（可在设置面板关闭）
 let progressSaveInterval = null; // 定期保存进度的计时器
 let currentVideoUrl = ''; // 记录当前实际的视频URL
 const isWebkit = (typeof window.webkitConvertPointFromNodeToPage === 'function')
+// iOS判定：iPhone/iPad UA，或 M系 iPad 伪装成 MacIntel 但支持多点触控
+const isIOSDevice = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 Artplayer.FULLSCREEN_WEB_IN_BODY = true;
 
 // 页面加载
@@ -170,6 +174,9 @@ function initializePageContent() {
 
     // 获取广告过滤设置
     adFilteringEnabled = localStorage.getItem(PLAYER_CONFIG.adFilteringStorage) !== 'false'; // 默认为true
+
+    // 获取 iOS 原生播放器设置
+    nativePlayerEnabled = localStorage.getItem(PLAYER_CONFIG.nativePlayerStorage) !== 'false'; // 默认为true
 
     // 监听自动连播开关变化
     document.getElementById('autoplayToggle').addEventListener('change', function (e) {
@@ -479,6 +486,18 @@ function initPlayer(videoUrl) {
         },
         customType: {
             m3u8: function (video, url) {
+                // iOS 上 hls.js 只能走 ManagedMediaSource，实测 (2026-11-07) 同一网络下
+                // 网页播放明显卡顿、Safari 原生 HLS 流畅。iOS 默认交给系统原生播放器，
+                // 可在首页设置面板「系统原生播放器」开关里关闭回到 hls.js。
+                if (isIOSDevice && nativePlayerEnabled) {
+                    // 原生播放不需要（也不能要）CORS 属性：crossOrigin 会强制
+                    // 要求源站返回 CORS 头，采集站 CDN 大多没有，反而会导致加载失败
+                    video.removeAttribute('crossorigin');
+                    setupNativeHlsFallback(video, url);
+                    video.src = url;
+                    return;
+                }
+
                 // 清理之前的HLS实例
                 if (currentHls && currentHls.destroy) {
                     try {
@@ -762,6 +781,27 @@ class CustomHlsJsLoader extends Hls.DefaultConfig.loader {
             load(context, config, callbacks);
         };
     }
+}
+
+// iOS 原生 HLS 的兜底：直连源站失败（部分采集站防盗链）时，改走 /proxy/ 中转重试一次。
+// 走 /proxy/ 后服务端会携带伪造 Referer，并把 m3u8 里的分片/KEY 重写回中转地址，
+// 原生播放器仍按普通 HLS 播放。
+function setupNativeHlsFallback(video, url) {
+  if (/^\/proxy\//.test(url)) return; // 已经是中转地址，不再兜底
+  let played = false;
+  let retried = false;
+  const onPlaying = () => { played = true; };
+  const onError = () => {
+    if (played || retried) return;
+    retried = true;
+    video.removeEventListener('error', onError);
+    video.removeEventListener('playing', onPlaying);
+    video.src = PROXY_URL + encodeURIComponent(url);
+    video.load();
+    video.play().catch(() => {});
+  };
+  video.addEventListener('error', onError);
+  video.addEventListener('playing', onPlaying);
 }
 
 // 过滤可疑的广告内容

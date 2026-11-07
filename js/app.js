@@ -54,6 +54,12 @@ document.addEventListener('DOMContentLoaded', function() {
         adFilterToggle.checked = localStorage.getItem(PLAYER_CONFIG.adFilteringStorage) !== 'false'; // 默认为true
     }
     
+    // 设置 iOS 原生播放器开关初始状态
+    const nativePlayerToggle = document.getElementById('nativePlayerToggle');
+    if (nativePlayerToggle) {
+        nativePlayerToggle.checked = localStorage.getItem(PLAYER_CONFIG.nativePlayerStorage) !== 'false'; // 默认true
+    }
+
     // 设置事件监听器
     setupEventListeners();
     
@@ -538,6 +544,14 @@ function setupEventListeners() {
     if (adFilterToggle) {
         adFilterToggle.addEventListener('change', function(e) {
             localStorage.setItem(PLAYER_CONFIG.adFilteringStorage, e.target.checked);
+        });
+    }
+
+    // iOS 原生播放器开关事件绑定
+    const nativePlayerToggle = document.getElementById('nativePlayerToggle');
+    if (nativePlayerToggle) {
+        nativePlayerToggle.addEventListener('change', function(e) {
+            localStorage.setItem(PLAYER_CONFIG.nativePlayerStorage, e.target.checked);
         });
     }
 }

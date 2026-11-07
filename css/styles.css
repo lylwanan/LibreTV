@@ -326,6 +326,20 @@ body {
     box-shadow: 0 0 0 2px rgba(0, 204, 255, 0.3);
 }
 
+/* 添加 iOS 原生播放器开关的CSS */
+#nativePlayerToggle:checked + .toggle-bg {
+  background-color: var(--primary-color);
+}
+
+#nativePlayerToggle:checked ~ .toggle-dot {
+  transform: translateX(1.5rem);
+}
+
+#nativePlayerToggle:focus + .toggle-bg,
+#nativePlayerToggle:hover + .toggle-bg {
+  box-shadow: 0 0 0 2px rgba(0, 204, 255, 0.3);
+}
+
 .toggle-dot {
     transition: transform 0.3s ease-in-out;
     box-shadow: 0 2px 4px rgba(0,0,0,0.2);
@@ -341,6 +355,10 @@ body {
 
 #adFilterToggle:checked ~ .toggle-dot {
     box-shadow: 0 2px 4px rgba(0, 204, 255, 0.3);
+}
+
+#nativePlayerToggle:checked ~ .toggle-dot {
+  box-shadow: 0 2px 4px rgba(0, 204, 255, 0.3);
 }
 
 /* 添加API复选框样式 */
